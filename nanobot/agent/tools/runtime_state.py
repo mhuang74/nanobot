@@ -1,5 +1,6 @@
 """RuntimeState protocol: agent loop state exposed to MyTool."""
 
+import asyncio
 from typing import Any, Protocol
 
 
@@ -49,7 +50,11 @@ class RuntimeState(Protocol):
     def subagents(self) -> Any: ...
 
     @property
-    def _runtime_vars(self) -> dict[str, Any]: ...
+    def _runtime_vars(self) -> dict[str, dict[str, Any]]: ...
+
+    _runtime_vars_lock: asyncio.Lock
+
+    _runtime_vars_lru: dict[str, float]
 
     @property
     def _last_usage(self) -> Any: ...

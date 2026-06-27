@@ -220,7 +220,13 @@ def test_save_config_rewrites_legacy_my_tool_keys(tmp_path) -> None:
     tools = saved["tools"]
     assert "myEnabled" not in tools
     assert "mySet" not in tools
-    assert tools["my"] == {"enable": False, "allowSet": True}
+    assert tools["my"] == {
+        "enable": False,
+        "allowSet": True,
+        "allowScratchpad": False,
+        "requireContext": False,
+        "sessionIsolation": True,
+    }
 
 
 def test_new_my_tool_keys_take_precedence_over_legacy(tmp_path) -> None:

@@ -27,3 +27,17 @@ HTTP/SSE MCP transports are part of this boundary: validate configured MCP URLs 
 `tools/sandbox.py` provides optional command wrapping. The only backend currently shipped is `bwrap` (bubblewrap), intended for containerized deployments. On Windows and bare-metal Linux without `bwrap`, commands run in the native shell with workspace restriction as an application-level guard only.
 
 **Rule**: If adding a new sandbox backend, implement `_wrap_<name>(command, workspace, cwd) -> str` and register it in `_BACKENDS`.
+
+## Runtime State Isolation
+
+`AgentLoop._runtime_vars` (the agent scratchpad) is namespaced by session key so one chat cannot read or write another's per-session notes.
+
+- `_runtime_vars` is a nested dict: `dict[str, dict[str, Any]]` (outer key = session key, inner = per-session scratchpad keys).
+- The `my` tool is the sole writer; it resolves the active scope via `current_request_context()` at execute time (ContextVar, not instance-captured), so concurrent turns cannot race on session scope.
+- `__global__` is a shared fallback scope used by CLI/test paths when no `RequestContext` is bound. Set `tools.my.require_context: true` in production to reject the `__global__` fallback and surface "no session context available" errors instead.
+- `tools.my.session_isolation: false` is an emergency kill-switch that flattens every session back onto `__global__` (pre-v1 behavior).
+- Per-value size cap: 8 KB (JSON-encoded). Per-session key cap: 64. Global session cap: 1024 with LRU eviction (the `__global__` scope is never evicted).
+- All count-check-then-write sequences are gated by `AgentLoop._runtime_vars_lock`.
+- Tool return strings and audit logs pass through `_redact_value` / `_SECRET_VALUE_RE` so sensitive-named keys and secret-shaped values appear as `<redacted>` and never reach chat channels, LLM context, or info logs.
+
+**Rule**: Any code that reads or writes `_runtime_vars` must go through the `my` tool's session-scope helpers (`_read_scope` / `_write_scope`) and never touch the nested dict directly.

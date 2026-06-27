@@ -340,7 +340,11 @@ class AgentLoop:
         if model_preset:
             self.set_model_preset(model_preset, publish_update=False)
         self._register_default_tools()
-        self._runtime_vars: dict[str, Any] = {}
+        # Scratchpad: namespaced by session key (outer) -> per-session dict.
+        # Session-isolation kill-switch flattens everything to __global__.
+        self._runtime_vars: dict[str, dict[str, Any]] = {}
+        self._runtime_vars_lock = asyncio.Lock()
+        self._runtime_vars_lru: dict[str, float] = {}
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
@@ -511,7 +515,13 @@ class AgentLoop:
         # MyTool needs runtime state reference — manual registration
         if self.tools_config.my.enable:
             self.tools.register(
-                MyTool(runtime_state=self, modify_allowed=self.tools_config.my.allow_set)
+                MyTool(
+                    runtime_state=self,
+                    modify_allowed=self.tools_config.my.allow_set,
+                    allow_scratchpad=self.tools_config.my.allow_scratchpad,
+                    require_context=self.tools_config.my.require_context,
+                    session_isolation=self.tools_config.my.session_isolation,
+                )
             )
             registered.append("my")
 
