@@ -1598,6 +1598,18 @@ class TestAuditRedaction:
         joined = "\n".join(log_sink)
         assert "42" in joined
 
+    @pytest.mark.asyncio
+    async def test_audit_session_label_reflects_bound_context(self, log_sink):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok = _bind_ctx("telegram:42", chat_id="42")
+        try:
+            await tool.execute(action="set", key="k", value=1)
+        finally:
+            reset_request_context(tok)
+        joined = "\n".join(log_sink)
+        assert "telegram:42" in joined
+
 
 class TestOutputRedaction:
     """D8. Tool return strings must not leak secrets."""
@@ -1649,6 +1661,34 @@ class TestOutputRedaction:
         result = await tool.execute(action="check", key="scratchpad")
         assert secret not in result
         assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_nested_secret_under_benign_key(self):
+        """D8: a secret nested in a dict under a non-sensitive top-level key
+        must not leak in the chat-visible set return string."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "sk-" + "a" * 40
+        result = await tool.execute(action="set", key="data", value={"api_key": secret})
+        assert "Set scratchpad" in result
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_nested_secret_in_list(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key="items", value=[secret, "ok"])
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_plain_for_benign_nested(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="set", key="data", value={"a": 1, "b": "x"})
+        assert "{'a': 1, 'b': 'x'}" in result
 
 
 class TestSessionCapEviction:

@@ -229,7 +229,13 @@ class MyTool(Tool, ContextAware):
         }
 
     def _audit(self, action: str, detail: str) -> None:
-        session = f"{self._channel}:{self._chat_id}" if self._channel else "unknown"
+        ctx = current_request_context()
+        if ctx and ctx.session_key:
+            session = ctx.session_key
+        elif self._channel:
+            session = f"{self._channel}:{self._chat_id}"
+        else:
+            session = "unknown"
         logger.info("self.{} | {} | session:{}", action, detail, session)
 
     # ------------------------------------------------------------------
@@ -329,12 +335,28 @@ class MyTool(Tool, ContextAware):
         return None
 
     def _redact_value(self, key: str, value: Any) -> str:
-        """Return a safe repr of ``value`` for audit logs and chat output."""
-        if self._is_sensitive_field_name(key):
+        """Return a safe repr of ``value`` for audit logs and chat output.
+
+        Redacts the whole value when ``key`` is sensitive or the value is a
+        secret-shaped scalar. Recurses into dict/list/tuple values so nested
+        secrets under a benign top-level key (e.g. ``data={"api_key": ...}``)
+        are also redacted before reaching chat or logs (D8).
+        """
+        return repr(self._redacted_copy(key, value))
+
+    @classmethod
+    def _redacted_copy(cls, key: str, value: Any) -> Any:
+        if cls._is_sensitive_field_name(key):
             return "<redacted>"
-        if isinstance(value, str) and _SECRET_VALUE_RE.match(value):
-            return "<redacted>"
-        return repr(value)
+        if isinstance(value, str):
+            return "<redacted>" if _SECRET_VALUE_RE.match(value) else value
+        if isinstance(value, dict):
+            return {str(k): cls._redacted_copy(str(k), v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._redacted_copy("", v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cls._redacted_copy("", v) for v in value)
+        return value
 
     # ------------------------------------------------------------------
     # Path resolution
