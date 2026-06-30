@@ -341,8 +341,11 @@ class MyTool(Tool, ContextAware):
             encoded = json.dumps(value, default=str, ensure_ascii=False)
         except (TypeError, ValueError) as e:
             return f"value not serializable: {e}"
-        if len(encoded) > MyTool._MAX_VALUE_BYTES:
-            return f"value exceeds {MyTool._MAX_VALUE_BYTES} bytes (got {len(encoded)})"
+        # Measure UTF-8 bytes, not Python characters, so multi-byte content
+        # (emoji, CJK, etc.) is bounded by the same DoS limit.
+        size = len(encoded.encode("utf-8"))
+        if size > MyTool._MAX_VALUE_BYTES:
+            return f"value exceeds {MyTool._MAX_VALUE_BYTES} bytes (got {size})"
         return None
 
     def _redact_value(self, key: str, value: Any) -> str:
@@ -362,7 +365,17 @@ class MyTool(Tool, ContextAware):
         if isinstance(value, str):
             return "<redacted>" if _SECRET_VALUE_RE.match(value) else value
         if isinstance(value, dict):
-            return {str(k): cls._redacted_copy(str(k), v) for k, v in value.items()}
+            out: dict[str, Any] = {}
+            for k, v in value.items():
+                sk = str(k)
+                # Redact keys that are themselves secret-shaped tokens
+                # (e.g. {"ghp_...": "prod"}) so the token never reaches
+                # chat-visible output or audit logs.
+                if isinstance(sk, str) and _SECRET_VALUE_RE.match(sk):
+                    out["<redacted>"] = cls._redacted_copy("", v)
+                else:
+                    out[sk] = cls._redacted_copy(sk, v)
+            return out
         if isinstance(value, list):
             return [cls._redacted_copy("", v) for v in value]
         if isinstance(value, tuple):

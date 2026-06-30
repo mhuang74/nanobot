@@ -1759,6 +1759,46 @@ class TestOutputRedaction:
         assert secret not in result
         assert "<redacted>" in result
 
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_dict_key(self):
+        """A dict key that is itself a secret-shaped token (e.g.
+        {"ghp_...": "prod"}) must be redacted so the token never reaches
+        chat-visible output or audit logs."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key="data", value={secret: "prod"})
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_dict_key(self):
+        """Secret-shaped dict keys must also be redacted on the check/inspect
+        path, not just the set return."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        loop._runtime_vars = {"__global__": {"data": {secret: "prod"}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+
+class TestValueSizeBytes:
+    """DoS size cap must be measured in UTF-8 bytes, not Python characters,
+    so multi-byte content (emoji, CJK) is bounded correctly."""
+
+    def test_multibyte_value_rejected_by_byte_length(self):
+        # ~8K emoji chars -> ~32KB UTF-8 bytes; must exceed the 8192-byte cap.
+        big = "😀" * 8200
+        err = MyTool._check_value_size(big)
+        assert err is not None
+        assert "exceeds" in err
+
+    def test_ascii_value_under_limit_accepted(self):
+        err = MyTool._check_value_size("a" * 100)
+        assert err is None
+
 
 class TestSessionCapEviction:
     """D11. Global session cap with LRU eviction."""
