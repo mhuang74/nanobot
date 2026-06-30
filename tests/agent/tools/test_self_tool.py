@@ -1357,6 +1357,21 @@ class TestScratchpadIsolation:
         assert "__global__" not in loop._runtime_vars or "k" not in loop._runtime_vars.get("__global__", {})
 
     @pytest.mark.asyncio
+    async def test_require_context_honored_with_isolation_kill_switch(self):
+        """require_context and session_isolation are independent: even when
+        the kill-switch (session_isolation=False) is on, require_context=True
+        must still reject context-less writes instead of silently falling back
+        to __global__."""
+        loop = _make_mock_loop()
+        tool = MyTool(
+            runtime_state=loop, modify_allowed=True,
+            require_context=True, session_isolation=False,
+        )
+        result = await tool.execute(action="set", key="k", value="v")
+        assert result == "Error: no session context available"
+        assert "__global__" not in loop._runtime_vars or "k" not in loop._runtime_vars.get("__global__", {})
+
+    @pytest.mark.asyncio
     async def test_require_context_blocks_read_without_session(self):
         loop = _make_mock_loop()
         tool = MyTool(runtime_state=loop, require_context=True)
@@ -1383,25 +1398,16 @@ class TestScratchpadIsolation:
         assert GLOBAL_SESSION_KEY in loop._runtime_vars
 
     @pytest.mark.asyncio
-    async def test_subagent_inherits_parent_session_scope(self):
-        """D17: a child task spawned while a RequestContext is bound inherits
-        the parent's session scope via ContextVar copy-on-create. Subagents
-        are launched with asyncio.create_task inside the parent turn, so their
-        scratchpad writes land in the parent's session scope."""
-        loop = _make_mock_loop()
-        tool = _make_tool(runtime_state=loop)
-
-        async def _subagent_write():
-            # Runs in a child task that inherits the bound RequestContext.
-            return await tool.execute(action="set", key="sub_note", value="hi")
-
-        tok = _bind_ctx("telegram:parent", chat_id="parent")
-        try:
-            await asyncio.create_task(_subagent_write())
-        finally:
-            reset_request_context(tok)
-        assert loop._runtime_vars["telegram:parent"]["sub_note"] == "hi"
-        assert GLOBAL_SESSION_KEY not in loop._runtime_vars
+    async def test_my_tool_excluded_from_subagent_scope(self):
+        """D17: subagents never receive the `my` tool — they cannot read or
+        write the parent's scratchpad. MyTool declares _scopes={'core'} and
+        _plugin_discoverable=False, so ToolLoader.load(scope='subagent')
+        excludes it on both counts. This resolves the v2 spec open question
+        #4: subagents run with an isolated tool registry that does not contain
+        `my`, so session-scope inheritance is moot."""
+        assert MyTool._plugin_discoverable is False
+        assert MyTool._scopes == {"core"}
+        assert "subagent" not in MyTool._scopes
 
 
 class TestScratchpadMigration:
@@ -1689,6 +1695,46 @@ class TestOutputRedaction:
         tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="data", value={"a": 1, "b": "x"})
         assert "{'a': 1, 'b': 'x'}" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_nested_secret_under_benign_key(self):
+        """D8 regression: a secret nested in a dict under a non-sensitive
+        top-level scratchpad key must not leak via the check/inspect path
+        (was previously only redacted on the set return; _format_value did
+        not recurse into dicts)."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"api_key": secret}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_in_list_value(self):
+        """D8 regression: a secret stored in a list scratchpad value must
+        not leak via check/inspect (list branch previously had no redaction)."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        loop._runtime_vars = {"__global__": {"items": [secret, "ok"]}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="items")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_check_scratchpad_redacts_nested_secret(self):
+        """D8 regression: check scratchpad (full session dict) must redact
+        nested secrets, not just the top level."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"api_key": secret}, "note": "ok"}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="scratchpad")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "ok" in result
 
 
 class TestSessionCapEviction:

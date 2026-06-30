@@ -70,6 +70,10 @@ class MyTool(Tool, ContextAware):
     """Check and set the agent loop's runtime configuration."""
 
     _plugin_discoverable = False  # Requires AgentLoop reference; registered manually
+    # D17: core-only — subagents never receive `my` (no scratchpad access from
+    # child agents). Excluded from scope="subagent" on two counts: this flag and
+    # _plugin_discoverable=False above.
+    _scopes = {"core"}
     config_key = "my"
 
     @classmethod
@@ -248,18 +252,23 @@ class MyTool(Tool, ContextAware):
         """Return the scratchpad session key, or None when ``require_context``
         is set and no request context is bound.
 
+        Precedence (independent flags, D12/D13):
+        - ``require_context`` is evaluated first: when set and no session is
+          bound, it rejects the call (returns None) regardless of
+          ``session_isolation``. This keeps the two flags independent as
+          documented — an operator can enable the kill-switch without
+          silently losing the context-rejection guarantee.
         - ``session_isolation=False`` forces everything to ``__global__``.
         - Otherwise the bound ``RequestContext.session_key`` is used, falling
-          back to ``__global__`` when no context is bound (unless
-          ``require_context`` rejects the fallback).
+          back to ``__global__`` when no context is bound.
         """
-        if not self._session_isolation:
-            return GLOBAL_SESSION_KEY
         ctx = current_request_context()
         key = ctx.session_key if ctx and ctx.session_key else None
+        if key is None and self._require_context:
+            return None
+        if not self._session_isolation:
+            return GLOBAL_SESSION_KEY
         if key is None:
-            if self._require_context:
-                return None
             return GLOBAL_SESSION_KEY
         return key
 
@@ -438,31 +447,27 @@ class MyTool(Tool, ContextAware):
             else:
                 r = repr(val)
             return f"{key}: {r}" if key else r
-        # Dict — small: show content (redacted), large: show keys for dot-path navigation
+        # Dict — small: show content (recursively redacted), large: show keys for dot-path navigation
         if isinstance(val, dict):
             ks = list(val.keys())
             if not ks:
                 return f"{key}: {{}}" if key else "{}"
             if len(ks) <= 5:
-                redacted = {}
-                for k, v in val.items():
-                    if isinstance(k, str) and MyTool._is_sensitive_field_name(k):
-                        redacted[k] = "<redacted>"
-                    elif isinstance(v, str) and _SECRET_VALUE_RE.match(v):
-                        redacted[k] = "<redacted>"
-                    else:
-                        redacted[k] = v
-                r = repr(redacted)
+                # Recurse via _redacted_copy so nested secrets under a benign
+                # top-level key (e.g. {"api_key": "sk-..."}) are also redacted
+                # before reaching chat output (D8). The >5-key branch below only
+                # surfaces key names, which is safe.
+                r = repr(MyTool._redacted_copy(key, val))
                 if len(r) <= 200:
                     return f"{key}: {r}" if key else r
             preview = ", ".join(str(k) for k in ks[:15])
             suffix = ", ..." if len(ks) > 15 else ""
             return f"{key}: {{{preview}{suffix}}}" if key else f"{{{preview}{suffix}}}"
-        # List/tuple — count for large, repr for small
+        # List/tuple — count for large, recursively redacted repr for small
         if isinstance(val, (list, tuple)):
             if len(val) > 20:
                 return f"{key}: [{len(val)} items]" if key else f"[{len(val)} items]"
-            r = repr(val)
+            r = repr(MyTool._redacted_copy(key, val))
             return f"{key}: {r}" if key else r
         # Complex object — small Pydantic models: show values; others: show field names for navigation
         cls_name = type(val).__name__

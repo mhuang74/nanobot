@@ -24,7 +24,9 @@ tools:
     allow_scratchpad: false   # default: false
     require_context: false    # default: false; set true in production to
                               # reject the shared __global__ fallback when no
-                              # per-session context is bound
+                              # per-session context is bound. Honored even when
+                              # session_isolation is false — the two flags are
+                              # independent.
     session_isolation: true   # default: true; set false to emergency-rollback
                               # to flat (shared) scratchpad behavior
 ```
