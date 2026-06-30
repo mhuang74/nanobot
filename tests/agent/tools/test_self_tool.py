@@ -1783,6 +1783,59 @@ class TestOutputRedaction:
         assert secret not in result
         assert "<redacted>" in result
 
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_scratchpad_key(self):
+        """A secret-shaped scratchpad key (e.g. ghp_... used as the key) must
+        be redacted in the chat-visible 'Set scratchpad.<key>' response and
+        audit log, not just the value."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key=secret, value="prod")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_scratchpad_key_allow_set(self):
+        """Same redaction must apply on the full allow_set path (_modify_free)."""
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key=secret, value="prod")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_key_in_large_dict_preview(self):
+        """When a scratchpad dict has >5 keys, the preview branch in
+        _format_value must redact secret-shaped keys, not surface them raw."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        data = {secret: "prod"}
+        data.update({f"k{i}": i for i in range(6)})
+        loop._runtime_vars = {"__global__": {"data": data}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_key_in_oversized_dict_preview(self):
+        """When a small dict's redacted repr exceeds 200 chars, the preview
+        branch must still redact secret-shaped keys."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        # 3 keys — small enough to enter the repr branch, but long values push
+        # the repr past 200 chars so it falls through to the preview branch.
+        data = {secret: "prod", "k1": "x" * 250, "k2": "y" * 250}
+        loop._runtime_vars = {"__global__": {"data": data}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
 
 class TestValueSizeBytes:
     """DoS size cap must be measured in UTF-8 bytes, not Python characters,

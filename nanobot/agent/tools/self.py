@@ -382,6 +382,20 @@ class MyTool(Tool, ContextAware):
             return tuple(cls._redacted_copy("", v) for v in value)
         return value
 
+    @staticmethod
+    def _redact_key(key: str) -> str:
+        """Return a safe representation of a scratchpad key for audit logs
+        and chat-visible output.
+
+        Redacts secret-shaped tokens (e.g. ``ghp_...``) and sensitive field
+        names so a credential accidentally used as a scratchpad key never
+        reaches chat output or logs. The raw key is still stored in the
+        scratchpad dict so lookups continue to work.
+        """
+        if _SECRET_VALUE_RE.match(key) or MyTool._is_sensitive_field_name(key):
+            return "<redacted>"
+        return key
+
     # ------------------------------------------------------------------
     # Path resolution
     # ------------------------------------------------------------------
@@ -475,7 +489,7 @@ class MyTool(Tool, ContextAware):
                 r = repr(MyTool._redacted_copy(key, val))
                 if len(r) <= 200:
                     return f"{key}: {r}" if key else r
-            preview = ", ".join(str(k) for k in ks[:15])
+            preview = ", ".join(MyTool._redact_key(str(k)) for k in ks[:15])
             suffix = ", ..." if len(ks) > 15 else ""
             return f"{key}: {{{preview}{suffix}}}" if key else f"{{{preview}{suffix}}}"
         # List/tuple — count for large, recursively redacted repr for small
@@ -639,8 +653,9 @@ class MyTool(Tool, ContextAware):
             scoped[key] = value
             r_old = self._redact_value(key, old)
             r_new = self._redact_value(key, value)
-            self._audit("modify", f"scratchpad.{key}: {r_old} -> {r_new}")
-            return f"Set scratchpad.{key} = {r_new}"
+            r_key = self._redact_key(key)
+            self._audit("modify", f"scratchpad.{r_key}: {r_old} -> {r_new}")
+            return f"Set scratchpad.{r_key} = {r_new}"
 
     async def _modify(self, key: str | None, value: Any) -> str:
         if err := self._validate_key(key):
@@ -763,8 +778,9 @@ class MyTool(Tool, ContextAware):
             scoped[key] = value
             r_old = self._redact_value(key, old)
             r_new = self._redact_value(key, value)
-            self._audit("modify", f"scratchpad.{key}: {r_old} -> {r_new}")
-            return f"Set scratchpad.{key} = {r_new}"
+            r_key = self._redact_key(key)
+            self._audit("modify", f"scratchpad.{r_key}: {r_old} -> {r_new}")
+            return f"Set scratchpad.{r_key} = {r_new}"
 
     @classmethod
     def _validate_json_safe(cls, value: Any, depth: int = 0) -> str | None:
