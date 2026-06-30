@@ -540,8 +540,10 @@ class OpenAICompatProvider(LLMProvider):
             and getattr(self._spec, "strip_history_reasoning_content", False)
         )
         if strip_reasoning:
-            for msg in sanitized:
-                msg.pop("reasoning_content", None)
+            sanitized = [
+                {k: v for k, v in msg.items() if k != "reasoning_content"}
+                for msg in sanitized
+            ]
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
