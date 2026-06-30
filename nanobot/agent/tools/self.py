@@ -124,7 +124,9 @@ class MyTool(Tool, ContextAware):
 
     @classmethod
     def _is_sensitive_field_name(cls, name: str) -> bool:
-        lowered = name.lower()
+        # Normalize camelCase (e.g. "apiKey" -> "api_key") so that JSON/config
+        # style keys are redacted just like their snake_case counterparts.
+        lowered = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
         return lowered in cls._SENSITIVE_NAMES or any(
             part in cls._SENSITIVE_NAMES for part in lowered.split("_")
         )

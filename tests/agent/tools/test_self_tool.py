@@ -1736,6 +1736,29 @@ class TestOutputRedaction:
         assert "<redacted>" in result
         assert "ok" in result
 
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_camelcase_secret_key(self):
+        """camelCase secret keys (apiKey, accessToken) must be redacted just
+        like their snake_case counterparts (D8 regression for camelCase)."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "sk-" + "a" * 40
+        result = await tool.execute(action="set", key="data", value={"apiKey": secret})
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_camelcase_secret_key(self):
+        """camelCase secret keys in scratchpad values must be redacted on the
+        check/inspect path too."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"accessToken": secret}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
 
 class TestSessionCapEviction:
     """D11. Global session cap with LRU eviction."""
