@@ -49,7 +49,7 @@ always: true
 </rule>
 
 <rule>
-**Don't store sensitive data.** No API keys, passwords, or tokens in scratchpad.
+**Don't store sensitive data.** No API keys, passwords, or tokens in scratchpad. Sensitive-named keys and secret-shaped values are redacted from output and audit logs, but the raw value may still be stored in memory.
 </rule>
 
 <rule>
@@ -59,9 +59,13 @@ always: true
 ## Constraints
 
 - All modifications in-memory only — restart resets everything
+- Scratchpad is scoped per session; other chats cannot read or write your keys
+- Per-value size cap 8 KB; per-session key cap 64; benign long strings may be redacted as `<redacted>`
 - Prefer `model_preset` for configured model choices. Direct `model` changes clear the active preset and should only be used when no preset exists.
 - Protected params have type/range validation: `max_iterations` (1–100), `context_window_tokens` (4096–1M), `model` (non-empty str)
 - If `tools.my.allow_set` is false, check only
+- If `tools.my.allow_scratchpad` is true (and `allow_set` is false), scratchpad writes are allowed but model/iteration/preset changes are still blocked
+- If `tools.my.require_context` is true, writes/reads without a bound session return an error instead of using the shared `__global__` scope
 
 ## Related tools
 

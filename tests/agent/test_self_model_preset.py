@@ -235,19 +235,19 @@ def test_self_tool_inspect_shows_model_preset(tmp_path) -> None:
     assert "model_preset: 'fast'" in output
 
 
-def test_self_tool_set_model_preset_via_modify(tmp_path) -> None:
+async def test_self_tool_set_model_preset_via_modify(tmp_path) -> None:
     presets = {
         "fast": ModelPresetConfig(model="openai/gpt-4.1"),
     }
     loop = _make_loop(tmp_path, presets=presets)
     tool = MyTool(runtime_state=loop, modify_allowed=True)
-    result = tool._modify("model_preset", "fast")
+    result = await tool._modify("model_preset", "fast")
     assert "Error" not in result
     assert loop.model_preset == "fast"
     assert loop.model == "openai/gpt-4.1"
 
 
-def test_self_tool_set_model_preset_switches_back_to_default(tmp_path) -> None:
+async def test_self_tool_set_model_preset_switches_back_to_default(tmp_path) -> None:
     presets = {
         "default": ModelPresetConfig(model="base-model", context_window_tokens=1000),
         "fast": ModelPresetConfig(model="openai/gpt-4.1", context_window_tokens=32_768),
@@ -255,7 +255,7 @@ def test_self_tool_set_model_preset_switches_back_to_default(tmp_path) -> None:
     loop = _make_loop(tmp_path, presets=presets, active_preset="fast")
     tool = MyTool(runtime_state=loop, modify_allowed=True)
 
-    result = tool._modify("model_preset", "default")
+    result = await tool._modify("model_preset", "default")
 
     assert "Error" not in result
     assert "model is now 'base-model'" in result
@@ -264,7 +264,7 @@ def test_self_tool_set_model_preset_switches_back_to_default(tmp_path) -> None:
     assert loop.context_window_tokens == 1000
 
 
-def test_self_tool_set_model_preset_unknown_lists_available(tmp_path) -> None:
+async def test_self_tool_set_model_preset_unknown_lists_available(tmp_path) -> None:
     presets = {
         "default": ModelPresetConfig(model="base-model"),
         "fast": ModelPresetConfig(model="openai/gpt-4.1"),
@@ -272,20 +272,20 @@ def test_self_tool_set_model_preset_unknown_lists_available(tmp_path) -> None:
     loop = _make_loop(tmp_path, presets=presets)
     tool = MyTool(runtime_state=loop, modify_allowed=True)
 
-    result = tool._modify("model_preset", "missing")
+    result = await tool._modify("model_preset", "missing")
 
     assert result == "Error: model_preset 'missing' not found. Available: default, fast."
     assert loop.model_preset is None
     assert loop.model == "base-model"
 
 
-def test_self_tool_set_model_clears_active_preset(tmp_path) -> None:
+async def test_self_tool_set_model_clears_active_preset(tmp_path) -> None:
     presets = {
         "fast": ModelPresetConfig(model="openai/gpt-4.1"),
     }
     loop = _make_loop(tmp_path, presets=presets, active_preset="fast")
     tool = MyTool(runtime_state=loop, modify_allowed=True)
-    result = tool._modify("model", "anthropic/claude-opus-4-5")
+    result = await tool._modify("model", "anthropic/claude-opus-4-5")
     assert "Error" not in result
     assert loop._active_preset is None
     assert loop.model == "anthropic/claude-opus-4-5"

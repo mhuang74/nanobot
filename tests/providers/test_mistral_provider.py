@@ -324,6 +324,7 @@ def test_mistral_strips_reasoning_content_from_history() -> None:
     sanitized = p._sanitize_messages(messages)
     assert all("reasoning_content" not in msg for msg in sanitized)
     assert sanitized[1]["content"] == "Hello!"
+    assert "reasoning_content" in messages[1], "original session history must not be mutated"
 
 
 def test_mistral_tool_call_ids_get_normalized() -> None:

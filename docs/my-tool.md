@@ -10,7 +10,7 @@ My tool fills this gap. With it, the agent can:
 
 - **Know who it is**: What model am I using? Where is my workspace? How many iterations remain?
 - **Adapt on the fly**: Complex task? Expand the context window. Simple chat? Switch to a faster model.
-- **Remember across turns**: Store notes in your scratchpad that persist into the next conversation turn.
+- **Remember across turns**: Store notes in your scratchpad that persist into the next conversation turn. Scratchpad is scoped per session — other chats cannot see your notes.
 
 ## Configuration
 
@@ -19,15 +19,36 @@ Enabled by default (read-only mode). The agent can check its state but not set i
 ```yaml
 tools:
   my:
-    enable: true       # default: true
-    allow_set: false   # default: false (read-only)
+    enable: true              # default: true
+    allow_set: false          # default: false (read-only)
+    allow_scratchpad: false   # default: false
+    require_context: false    # default: false; set true in production to
+                              # reject the shared __global__ fallback when no
+                              # per-session context is bound. Honored even when
+                              # session_isolation is false — the two flags are
+                              # independent.
+    session_isolation: true   # default: true; set false to emergency-rollback
+                              # to flat (shared) scratchpad behavior
 ```
 
 To allow the agent to set its configuration (e.g. switch models, adjust parameters), set `tools.my.allow_set: true`.
 
+To allow the agent to write harmless per-session scratchpad notes **without** granting it the ability to change models, iterations, or other runtime state, set `tools.my.allow_scratchpad: true`. This is useful when `allow_set` is `false` but you still want the agent to remember things across turns.
+
 Legacy `tools.myEnabled` / `tools.mySet` keys are auto-migrated on load, and rewritten in-place the next time `nanobot onboard` refreshes the config.
 
 All modifications are held in memory only — restart restores defaults.
+
+### Scratchpad session isolation
+
+The scratchpad is **namespaced per session** (channel + chat id, or the unified session key). One chat cannot read, overwrite, or list another chat's scratchpad keys:
+
+- `set` writes land in the caller's session scope.
+- `check <key>` / `check scratchpad` / `check` (no key) only show the caller's scope.
+
+When no session context is bound (CLI, tests, direct SDK calls), writes/reads fall back to a shared `__global__` scope. Set `tools.my.require_context: true` in multi-user production deployments to reject that fallback and surface `"Error: no session context available"` instead.
+
+Bounded to prevent memory exhaustion: each value is capped at 8 KB, each session holds at most 64 keys, and at most 1024 concurrent sessions are kept (least-recently-used sessions are evicted; `__global__` is never evicted). Tool output and audit logs redact sensitive-named keys and secret-shaped values (`sk-...`, `ghp_...`, `AKIA...`, JWTs, PEM blocks, etc.) as `<redacted>`. Benign long strings that happen to match the secret regex may also appear as `<redacted>` — this is an accepted security tradeoff.
 
 ---
 
@@ -205,6 +226,22 @@ Can be checked but not set:
 | Execution config | `exec_config` | Can check sandbox/enable status, cannot change it |
 | Web config | `web_config` | Can check enable status, cannot change it |
 | Iteration counter | `_current_iteration` | Updated by runner only |
+
+### Scratchpad-only mode (`allow_scratchpad: true`)
+
+When `allow_set` is `false` but `allow_scratchpad` is `true`, the agent enters **scratchpad-only mode**. It can:
+
+- **Check** any readable config value (same as read-only mode)
+- **Set** harmless scratchpad keys (per-session notes stored in `_runtime_vars`)
+
+It **cannot**:
+
+- Change `model`, `model_preset`, `max_iterations`, or `context_window_tokens`
+- Modify any real runtime attribute (workspace, exec_config, web_config, etc.)
+- Use dot-paths to traverse into config objects
+- Access blocked or sensitive fields
+
+This mode is designed for multi-user or restricted environments where you want the agent to take notes across turns without the risk of it self-modifying its runtime configuration.
 
 ### Sensitive field protection
 

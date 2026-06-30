@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.context import ContextAware, RequestContext
+from nanobot.agent.tools.context import ContextAware, RequestContext, current_request_context
 from nanobot.agent.tools.runtime_state import RuntimeState
 from nanobot.config_base import Base
 
@@ -16,10 +18,33 @@ if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentStatus
 
 
+GLOBAL_SESSION_KEY = "__global__"
+
+# Expanded secret-shaped value regex (D14). Catches common credential shapes so
+# they never reach audit logs or chat-visible tool output.
+_SECRET_VALUE_RE = re.compile(
+    r"^(sk-[A-Za-z0-9]{20,}|"
+    r"Bearer\s+[A-Za-z0-9_\-\.]{10,}|"
+    r"xox[bpoar]-[A-Za-z0-9\-]+|"
+    r"gh[ps]_[A-Za-z0-9]{20,}|"
+    r"AIza[0-9A-Za-z_-]{30,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"ASIA[0-9A-Z]{16}|"
+    r"Basic\s+[A-Za-z0-9+/=]{10,}|"
+    r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*|"
+    r"-----BEGIN\s+(RSA\s+|OPENSSH\s+|EC\s+|DSA\s+)?PRIVATE KEY-----|"
+    r"[A-Fa-f0-9]{64}|"
+    r"[A-Za-z0-9_-]{40,}$)"
+)
+
+
 class MyToolConfig(Base):
     """Self-inspection tool configuration."""
     enable: bool = True
     allow_set: bool = False
+    allow_scratchpad: bool = False
+    require_context: bool = False
+    session_isolation: bool = True
 
 
 def _has_real_attr(obj: Any, key: str) -> bool:
@@ -45,6 +70,10 @@ class MyTool(Tool, ContextAware):
     """Check and set the agent loop's runtime configuration."""
 
     _plugin_discoverable = False  # Requires AgentLoop reference; registered manually
+    # D17: core-only — subagents never receive `my` (no scratchpad access from
+    # child agents). Excluded from scope="subagent" on two counts: this flag and
+    # _plugin_discoverable=False above.
+    _scopes = {"core"}
     config_key = "my"
 
     @classmethod
@@ -95,7 +124,9 @@ class MyTool(Tool, ContextAware):
 
     @classmethod
     def _is_sensitive_field_name(cls, name: str) -> bool:
-        lowered = name.lower()
+        # Normalize camelCase (e.g. "apiKey" -> "api_key") so that JSON/config
+        # style keys are redacted just like their snake_case counterparts.
+        lowered = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
         return lowered in cls._SENSITIVE_NAMES or any(
             part in cls._SENSITIVE_NAMES for part in lowered.split("_")
         )
@@ -107,10 +138,21 @@ class MyTool(Tool, ContextAware):
     }
 
     _MAX_RUNTIME_KEYS = 64
+    _MAX_VALUE_BYTES = 8192
 
-    def __init__(self, runtime_state: RuntimeState, modify_allowed: bool = True) -> None:
+    def __init__(
+        self,
+        runtime_state: RuntimeState,
+        modify_allowed: bool = True,
+        allow_scratchpad: bool = False,
+        require_context: bool = False,
+        session_isolation: bool = True,
+    ) -> None:
         self._runtime_state = runtime_state
         self._modify_allowed = modify_allowed
+        self._allow_scratchpad = allow_scratchpad
+        self._require_context = require_context
+        self._session_isolation = session_isolation
         self._channel = ""
         self._chat_id = ""
 
@@ -120,6 +162,9 @@ class MyTool(Tool, ContextAware):
         memo[id(self)] = result
         result._runtime_state = self._runtime_state
         result._modify_allowed = self._modify_allowed
+        result._allow_scratchpad = self._allow_scratchpad
+        result._require_context = self._require_context
+        result._session_isolation = self._session_isolation
         result._channel = self._channel
         result._chat_id = self._chat_id
         return result
@@ -153,8 +198,14 @@ class MyTool(Tool, ContextAware):
             "- User asks you to remember a preference for this session → set to store it in your scratchpad.\n"
             "- About to start a large task → check context_window_tokens and max_iterations first."
         )
-        if not self._modify_allowed:
+        if not self._modify_allowed and not self._allow_scratchpad:
             base += "\nREAD-ONLY MODE: set is disabled."
+        elif not self._modify_allowed and self._allow_scratchpad:
+            base += (
+                "\nSCRATCHPAD-ONLY MODE: set is limited to scratchpad keys "
+                "(harmless per-session notes). Model, iterations, and other "
+                "runtime state cannot be changed."
+            )
         else:
             base += (
                 "\nIMPORTANT: Before setting state, predict the potential impact. "
@@ -184,8 +235,166 @@ class MyTool(Tool, ContextAware):
         }
 
     def _audit(self, action: str, detail: str) -> None:
-        session = f"{self._channel}:{self._chat_id}" if self._channel else "unknown"
+        ctx = current_request_context()
+        if ctx and ctx.session_key:
+            session = ctx.session_key
+        elif self._channel:
+            session = f"{self._channel}:{self._chat_id}"
+        else:
+            session = "unknown"
         logger.info("self.{} | {} | session:{}", action, detail, session)
+
+    # ------------------------------------------------------------------
+    # Session scope helpers (D2, D3, D11, D12, D13)
+    # ------------------------------------------------------------------
+
+    _MAX_SESSIONS = 1024
+
+    def _resolve_session_key(self) -> str | None:
+        """Return the scratchpad session key, or None when ``require_context``
+        is set and no request context is bound.
+
+        Precedence (independent flags, D12/D13):
+        - ``require_context`` is evaluated first: when set and no session is
+          bound, it rejects the call (returns None) regardless of
+          ``session_isolation``. This keeps the two flags independent as
+          documented — an operator can enable the kill-switch without
+          silently losing the context-rejection guarantee.
+        - ``session_isolation=False`` forces everything to ``__global__``.
+        - Otherwise the bound ``RequestContext.session_key`` is used, falling
+          back to ``__global__`` when no context is bound.
+        """
+        ctx = current_request_context()
+        key = ctx.session_key if ctx and ctx.session_key else None
+        if key is None and self._require_context:
+            return None
+        if not self._session_isolation:
+            return GLOBAL_SESSION_KEY
+        if key is None:
+            return GLOBAL_SESSION_KEY
+        return key
+
+    def _read_scope(self) -> dict[str, Any] | None:
+        """Return the caller's per-session dict for reads (no creation).
+
+        Returns an empty dict when the session has no scratchpad yet, and
+        None only when ``require_context`` blocks the call.
+        """
+        key = self._resolve_session_key()
+        if key is None:
+            return None
+        rc = self._runtime_state
+        scoped = rc._runtime_vars.get(key)
+        if scoped is None:
+            return {}
+        # Refresh LRU on access.
+        rc._runtime_vars_lru[key] = time.monotonic()
+        return scoped
+
+    def _write_scope(self) -> dict[str, Any] | None:
+        """Return the caller's per-session dict for writes, creating it lazily
+        and enforcing the global session cap with LRU eviction.
+
+        Must be called while holding ``_runtime_vars_lock``.
+        Returns None when ``require_context`` blocks the call.
+        """
+        key = self._resolve_session_key()
+        if key is None:
+            return None
+        rc = self._runtime_state
+        scoped = rc._runtime_vars.get(key)
+        if scoped is None:
+            scoped = {}
+            rc._runtime_vars[key] = scoped
+            self._enforce_session_cap()
+        rc._runtime_vars_lru[key] = time.monotonic()
+        return scoped
+
+    def _enforce_session_cap(self) -> None:
+        """Evict least-recently-used sessions when over ``_MAX_SESSIONS``."""
+        rc = self._runtime_state
+        cap = self._MAX_SESSIONS
+        while len(rc._runtime_vars) > cap:
+            lru = rc._runtime_vars_lru
+            if not lru:
+                break
+            # Never evict the global fallback scope.
+            victim = min(
+                (k for k in lru if k != GLOBAL_SESSION_KEY),
+                key=lambda k: lru[k],
+                default=None,
+            )
+            if victim is None:
+                break
+            rc._runtime_vars.pop(victim, None)
+            lru.pop(victim, None)
+            logger.info(
+                "self.scratchpad | evicted session {} (cap {} reached) | "
+                "scratchpad_session_count={}",
+                victim, cap, len(rc._runtime_vars),
+            )
+
+    @staticmethod
+    def _check_value_size(value: Any) -> str | None:
+        """Reject values whose JSON encoding exceeds ``_MAX_VALUE_BYTES``."""
+        try:
+            encoded = json.dumps(value, default=str, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            return f"value not serializable: {e}"
+        # Measure UTF-8 bytes, not Python characters, so multi-byte content
+        # (emoji, CJK, etc.) is bounded by the same DoS limit.
+        size = len(encoded.encode("utf-8"))
+        if size > MyTool._MAX_VALUE_BYTES:
+            return f"value exceeds {MyTool._MAX_VALUE_BYTES} bytes (got {size})"
+        return None
+
+    def _redact_value(self, key: str, value: Any) -> str:
+        """Return a safe repr of ``value`` for audit logs and chat output.
+
+        Redacts the whole value when ``key`` is sensitive or the value is a
+        secret-shaped scalar. Recurses into dict/list/tuple values so nested
+        secrets under a benign top-level key (e.g. ``data={"api_key": ...}``)
+        are also redacted before reaching chat or logs (D8).
+        """
+        return repr(self._redacted_copy(key, value))
+
+    @classmethod
+    def _redacted_copy(cls, key: str, value: Any) -> Any:
+        if cls._is_sensitive_field_name(key):
+            return "<redacted>"
+        if isinstance(value, str):
+            return "<redacted>" if _SECRET_VALUE_RE.match(value) else value
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for k, v in value.items():
+                sk = str(k)
+                # Redact keys that are themselves secret-shaped tokens
+                # (e.g. {"ghp_...": "prod"}) so the token never reaches
+                # chat-visible output or audit logs.
+                if isinstance(sk, str) and _SECRET_VALUE_RE.match(sk):
+                    out["<redacted>"] = cls._redacted_copy("", v)
+                else:
+                    out[sk] = cls._redacted_copy(sk, v)
+            return out
+        if isinstance(value, list):
+            return [cls._redacted_copy("", v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cls._redacted_copy("", v) for v in value)
+        return value
+
+    @staticmethod
+    def _redact_key(key: str) -> str:
+        """Return a safe representation of a scratchpad key for audit logs
+        and chat-visible output.
+
+        Redacts secret-shaped tokens (e.g. ``ghp_...``) and sensitive field
+        names so a credential accidentally used as a scratchpad key never
+        reaches chat output or logs. The raw key is still stored in the
+        scratchpad dict so lookups continue to work.
+        """
+        if _SECRET_VALUE_RE.match(key) or MyTool._is_sensitive_field_name(key):
+            return "<redacted>"
+        return key
 
     # ------------------------------------------------------------------
     # Path resolution
@@ -258,27 +467,36 @@ class MyTool(Tool, ContextAware):
             return "\n".join(lines)
         if hasattr(val, "tool_names"):
             return f"tools: {len(val.tool_names)} registered — {val.tool_names}"
-        # Scalar types — repr is fine
+        # Scalar types — repr, with redaction for sensitive keys / secret values
         if isinstance(val, (str, int, float, bool, type(None))):
-            r = repr(val)
+            if key and MyTool._is_sensitive_field_name(key):
+                r = "<redacted>"
+            elif isinstance(val, str) and _SECRET_VALUE_RE.match(val):
+                r = "<redacted>"
+            else:
+                r = repr(val)
             return f"{key}: {r}" if key else r
-        # Dict — small: show content; large: show keys for dot-path navigation
+        # Dict — small: show content (recursively redacted), large: show keys for dot-path navigation
         if isinstance(val, dict):
             ks = list(val.keys())
             if not ks:
                 return f"{key}: {{}}" if key else "{}"
             if len(ks) <= 5:
-                r = repr(val)
+                # Recurse via _redacted_copy so nested secrets under a benign
+                # top-level key (e.g. {"api_key": "sk-..."}) are also redacted
+                # before reaching chat output (D8). The >5-key branch below only
+                # surfaces key names, which is safe.
+                r = repr(MyTool._redacted_copy(key, val))
                 if len(r) <= 200:
                     return f"{key}: {r}" if key else r
-            preview = ", ".join(str(k) for k in ks[:15])
+            preview = ", ".join(MyTool._redact_key(str(k)) for k in ks[:15])
             suffix = ", ..." if len(ks) > 15 else ""
             return f"{key}: {{{preview}{suffix}}}" if key else f"{{{preview}{suffix}}}"
-        # List/tuple — count for large, repr for small
+        # List/tuple — count for large, recursively redacted repr for small
         if isinstance(val, (list, tuple)):
             if len(val) > 20:
                 return f"{key}: [{len(val)} items]" if key else f"[{len(val)} items]"
-            r = repr(val)
+            r = repr(MyTool._redacted_copy(key, val))
             return f"{key}: {r}" if key else r
         # Complex object — small Pydantic models: show values; others: show field names for navigation
         cls_name = type(val).__name__
@@ -321,9 +539,11 @@ class MyTool(Tool, ContextAware):
         if action in ("inspect", "check"):
             return self._inspect(key)
         if not self._modify_allowed:
+            if self._allow_scratchpad and action in ("modify", "set"):
+                return await self._modify_scratchpad_only(key, value)
             return "Error: set is disabled (tools.my.allow_set is false)"
         if action in ("modify", "set"):
-            return self._modify(key, value)
+            return await self._modify(key, value)
         return f"Unknown action: {action}"
 
     # -- inspect --
@@ -334,20 +554,28 @@ class MyTool(Tool, ContextAware):
         top = key.split(".")[0]
         if top in self._DENIED_ATTRS or top.startswith("__"):
             return f"Error: '{top}' is not accessible"
+        # "scratchpad" alias for the caller's session-scoped dict — handled
+        # before path resolution so mock/real runtime states behave identically.
+        if key == "scratchpad":
+            scoped = self._read_scope()
+            if scoped is None:
+                return "Error: no session context available"
+            return self._format_value(scoped, "scratchpad") if scoped else "scratchpad is empty"
         obj, err = self._resolve_path(key)
         if err:
-            # "scratchpad" alias for _runtime_vars
-            if key == "scratchpad":
-                rv = self._runtime_state._runtime_vars
-                return self._format_value(rv, "scratchpad") if rv else "scratchpad is empty"
-            # Fallback: check _runtime_vars for simple keys stored by modify
-            if "." not in key and key in self._runtime_state._runtime_vars:
-                return self._format_value(self._runtime_state._runtime_vars[key], key)
+            # Fallback: check session-scoped _runtime_vars for simple keys
+            if "." not in key:
+                scoped = self._read_scope()
+                if scoped is None:
+                    return "Error: no session context available"
+                if key in scoped:
+                    return self._format_value(scoped[key], key)
             return f"Error: {err}"
         # Guard against mock auto-generated attributes
         if "." not in key and not _has_real_attr(self._runtime_state, key):
-            if key in self._runtime_state._runtime_vars:
-                return self._format_value(self._runtime_state._runtime_vars[key], key)
+            scoped = self._read_scope()
+            if scoped is not None and key in scoped:
+                return self._format_value(scoped[key], key)
             return f"Error: '{key}' not found"
         return self._format_value(obj, key)
 
@@ -366,14 +594,70 @@ class MyTool(Tool, ContextAware):
         usage = state._last_usage
         if usage:
             parts.append(self._format_value(usage, "_last_usage"))
-        rv = state._runtime_vars
-        if rv:
-            parts.append(self._format_value(rv, "scratchpad"))
+        scoped = self._read_scope()
+        if scoped is not None and scoped:
+            parts.append(self._format_value(scoped, "scratchpad"))
         return "\n".join(parts)
 
     # -- modify --
 
-    def _modify(self, key: str | None, value: Any) -> str:
+    async def _modify_scratchpad_only(self, key: str | None, value: Any) -> str:
+        """Scratchpad-only path: allows writing to _runtime_vars but blocks
+        all real attribute modifications, dot-paths, restricted keys, and
+        sensitive names."""
+        if err := self._validate_key(key):
+            return err
+        # Block dot-paths first — scratchpad keys are simple keys only
+        if "." in key:
+            self._audit("modify", f"BLOCKED dot-path '{key}' (scratchpad-only mode)")
+            return "Error: dot-paths are not allowed in scratchpad-only mode"
+        # Block everything that _modify would block
+        if key in self.BLOCKED or key in self._DENIED_ATTRS or key.startswith("__") or key.lower() in self._SENSITIVE_NAMES:
+            self._audit("modify", f"BLOCKED {key}")
+            return f"Error: '{key}' is protected and cannot be modified"
+        if key in self.READ_ONLY:
+            self._audit("modify", f"READ_ONLY {key}")
+            return f"Error: '{key}' is read-only and cannot be modified"
+        # Block restricted keys (max_iterations, context_window_tokens, model)
+        if key in self.RESTRICTED:
+            self._audit("modify", f"BLOCKED restricted '{key}' (scratchpad-only mode)")
+            return f"Error: '{key}' cannot be modified in scratchpad-only mode"
+        # Block model_preset
+        if key == "model_preset":
+            self._audit("modify", "BLOCKED model_preset (scratchpad-only mode)")
+            return "Error: 'model_preset' cannot be modified in scratchpad-only mode"
+        # Block keys that are real attributes on the runtime state
+        if _has_real_attr(self._runtime_state, key):
+            self._audit("modify", f"BLOCKED real attr '{key}' (scratchpad-only mode)")
+            return f"Error: '{key}' is a runtime attribute and cannot be modified in scratchpad-only mode"
+        # Only allow JSON-safe values
+        if callable(value):
+            self._audit("modify", f"REJECTED callable {key}")
+            return "Error: cannot store callable values"
+        err = self._validate_json_safe(value)
+        if err:
+            self._audit("modify", f"REJECTED {key}: {err}")
+            return f"Error: {err}"
+        err = self._check_value_size(value)
+        if err:
+            self._audit("modify", f"REJECTED {key}: {err}")
+            return f"Error: {err}"
+        async with self._runtime_state._runtime_vars_lock:
+            scoped = self._write_scope()
+            if scoped is None:
+                return "Error: no session context available"
+            if key not in scoped and len(scoped) >= self._MAX_RUNTIME_KEYS:
+                self._audit("modify", f"REJECTED {key}: max keys ({self._MAX_RUNTIME_KEYS}) reached")
+                return f"Error: scratchpad is full (max {self._MAX_RUNTIME_KEYS} keys). Remove unused keys first."
+            old = scoped.get(key)
+            scoped[key] = value
+            r_old = self._redact_value(key, old)
+            r_new = self._redact_value(key, value)
+            r_key = self._redact_key(key)
+            self._audit("modify", f"scratchpad.{r_key}: {r_old} -> {r_new}")
+            return f"Set scratchpad.{r_key} = {r_new}"
+
+    async def _modify(self, key: str | None, value: Any) -> str:
         if err := self._validate_key(key):
             return err
         top = key.split(".")[0]
@@ -398,19 +682,20 @@ class MyTool(Tool, ContextAware):
                 parent[leaf] = value
             else:
                 setattr(parent, leaf, value)
-            self._audit("modify", f"{key} = {value!r}")
-            return f"Set {key} = {value!r}"
+            r_new = self._redact_value(leaf, value)
+            self._audit("modify", f"{key} = {r_new}")
+            return f"Set {key} = {r_new}"
         if key == "model_preset":
-            return self._modify_model_preset(value)
+            return await self._modify_model_preset(value)
         if key in self.RESTRICTED:
             return self._modify_restricted(key, value)
-        return self._modify_free(key, value)
+        return await self._modify_free(key, value)
 
-    def _modify_model_preset(self, value: Any) -> str:
+    async def _modify_model_preset(self, value: Any) -> str:
         if not isinstance(value, str) or not value.strip():
             return "Error: 'model_preset' must be a non-empty string"
         name = value.strip()
-        result = self._modify_free("model_preset", name)
+        result = await self._modify_free("model_preset", name)
         if result.startswith("Error:"):
             return result if result.endswith((".", "!", "?")) else f"{result}."
         return (
@@ -443,10 +728,12 @@ class MyTool(Tool, ContextAware):
             sync_replay()
         if key == "max_iterations" and hasattr(self._runtime_state, "_sync_subagent_runtime_limits"):
             self._runtime_state._sync_subagent_runtime_limits()
-        self._audit("modify", f"{key}: {old!r} -> {value!r}")
-        return f"Set {key} = {value!r} (was {old!r})"
+        r_old = self._redact_value(key, old)
+        r_new = self._redact_value(key, value)
+        self._audit("modify", f"{key}: {r_old} -> {r_new}")
+        return f"Set {key} = {r_new} (was {r_old})"
 
-    def _modify_free(self, key: str, value: Any) -> str:
+    async def _modify_free(self, key: str, value: Any) -> str:
         if _has_real_attr(self._runtime_state, key):
             old = getattr(self._runtime_state, key)
             if isinstance(old, (str, int, float, bool)):
@@ -465,8 +752,10 @@ class MyTool(Tool, ContextAware):
                 message = str(e.args[0] if isinstance(e, KeyError) and e.args else e).strip('"')
                 self._audit("modify", f"REJECTED {key}: {message}")
                 return f"Error: {message}"
-            self._audit("modify", f"{key}: {old!r} -> {value!r}")
-            return f"Set {key} = {value!r} (was {old!r})"
+            r_old = self._redact_value(key, old)
+            r_new = self._redact_value(key, value)
+            self._audit("modify", f"{key}: {r_old} -> {r_new}")
+            return f"Set {key} = {r_new} (was {r_old})"
         if callable(value):
             self._audit("modify", f"REJECTED callable {key}")
             return "Error: cannot store callable values"
@@ -474,13 +763,24 @@ class MyTool(Tool, ContextAware):
         if err:
             self._audit("modify", f"REJECTED {key}: {err}")
             return f"Error: {err}"
-        if key not in self._runtime_state._runtime_vars and len(self._runtime_state._runtime_vars) >= self._MAX_RUNTIME_KEYS:
-            self._audit("modify", f"REJECTED {key}: max keys ({self._MAX_RUNTIME_KEYS}) reached")
-            return f"Error: scratchpad is full (max {self._MAX_RUNTIME_KEYS} keys). Remove unused keys first."
-        old = self._runtime_state._runtime_vars.get(key)
-        self._runtime_state._runtime_vars[key] = value
-        self._audit("modify", f"scratchpad.{key}: {old!r} -> {value!r}")
-        return f"Set scratchpad.{key} = {value!r}"
+        err = self._check_value_size(value)
+        if err:
+            self._audit("modify", f"REJECTED {key}: {err}")
+            return f"Error: {err}"
+        async with self._runtime_state._runtime_vars_lock:
+            scoped = self._write_scope()
+            if scoped is None:
+                return "Error: no session context available"
+            if key not in scoped and len(scoped) >= self._MAX_RUNTIME_KEYS:
+                self._audit("modify", f"REJECTED {key}: max keys ({self._MAX_RUNTIME_KEYS}) reached")
+                return f"Error: scratchpad is full (max {self._MAX_RUNTIME_KEYS} keys). Remove unused keys first."
+            old = scoped.get(key)
+            scoped[key] = value
+            r_old = self._redact_value(key, old)
+            r_new = self._redact_value(key, value)
+            r_key = self._redact_key(key)
+            self._audit("modify", f"scratchpad.{r_key}: {r_old} -> {r_new}")
+            return f"Set scratchpad.{r_key} = {r_new}"
 
     @classmethod
     def _validate_json_safe(cls, value: Any, depth: int = 0) -> str | None:

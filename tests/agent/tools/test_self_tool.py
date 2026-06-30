@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from loguru import logger
 from pydantic import BaseModel
 
-from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
+from nanobot.agent.tools.self import GLOBAL_SESSION_KEY, MyTool
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,6 +32,8 @@ def _make_mock_loop(**overrides):
     loop.channels_config = MagicMock()
     loop._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
     loop._runtime_vars = {}
+    loop._runtime_vars_lock = asyncio.Lock()
+    loop._runtime_vars_lru = {}
     loop._current_iteration = 0
     loop.provider_retry_mode = "standard"
     loop.max_tool_result_chars = 16000
@@ -64,6 +70,13 @@ def _make_tool(runtime_state=None):
     return MyTool(runtime_state=runtime_state)
 
 
+def _bind_ctx(session_key: str, channel: str = "telegram", chat_id: str = "1"):
+    """Bind a RequestContext for the duration of a test. Returns the token."""
+    return bind_request_context(RequestContext(
+        channel=channel, chat_id=chat_id, session_key=session_key,
+    ))
+
+
 # ---------------------------------------------------------------------------
 # check — no key (summary)
 # ---------------------------------------------------------------------------
@@ -80,7 +93,7 @@ class TestInspectSummary:
     @pytest.mark.asyncio
     async def test_inspect_includes_runtime_vars(self):
         loop = _make_mock_loop()
-        loop._runtime_vars = {"task": "review"}
+        loop._runtime_vars = {"__global__": {"task": "review"}}
         tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check")
         assert "task" in result
@@ -323,7 +336,7 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="set", key="my_custom_var", value="hello")
         assert "my_custom_var" in result
-        assert tool._runtime_state._runtime_vars["my_custom_var"] == "hello"
+        assert tool._runtime_state._runtime_vars["__global__"]["my_custom_var"] == "hello"
 
     @pytest.mark.asyncio
     async def test_modify_rejects_callable(self):
@@ -342,14 +355,14 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="set", key="items", value=[1, 2, 3])
         assert result == "Set scratchpad.items = [1, 2, 3]"
-        assert tool._runtime_state._runtime_vars["items"] == [1, 2, 3]
+        assert tool._runtime_state._runtime_vars["__global__"]["items"] == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test_modify_allows_dict(self):
         tool = _make_tool()
         result = await tool.execute(action="set", key="data", value={"a": 1})
         assert result == "Set scratchpad.data = {'a': 1}"
-        assert tool._runtime_state._runtime_vars["data"] == {"a": 1}
+        assert tool._runtime_state._runtime_vars["__global__"]["data"] == {"a": 1}
 
     @pytest.mark.asyncio
     async def test_modify_whitespace_key_rejected(self):
@@ -583,20 +596,20 @@ class TestRuntimeVarsLimits:
     @pytest.mark.asyncio
     async def test_runtime_vars_rejects_at_max_keys(self):
         loop = _make_mock_loop()
-        loop._runtime_vars = {f"key_{i}": i for i in range(64)}
+        loop._runtime_vars = {"__global__": {f"key_{i}": i for i in range(64)}}
         tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="overflow", value="data")
         assert "full" in result
-        assert "overflow" not in loop._runtime_vars
+        assert "overflow" not in loop._runtime_vars["__global__"]
 
     @pytest.mark.asyncio
     async def test_runtime_vars_allows_update_existing_key_at_max(self):
         loop = _make_mock_loop()
-        loop._runtime_vars = {f"key_{i}": i for i in range(64)}
+        loop._runtime_vars = {"__global__": {f"key_{i}": i for i in range(64)}}
         tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="key_0", value="updated")
         assert "Error" not in result
-        assert loop._runtime_vars["key_0"] == "updated"
+        assert loop._runtime_vars["__global__"]["key_0"] == "updated"
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +908,124 @@ class TestReadOnlyMode:
 
 
 # ---------------------------------------------------------------------------
+# scratchpad-only mode (tools.my.allow_set=False, allow_scratchpad=True)
+# ---------------------------------------------------------------------------
+
+class TestScratchpadOnlyMode:
+
+    def _make_scratchpad_tool(self):
+        loop = _make_mock_loop()
+        return MyTool(runtime_state=loop, modify_allowed=False, allow_scratchpad=True)
+
+    @pytest.mark.asyncio
+    async def test_inspect_allowed_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="check", key="max_iterations")
+        assert "40" in result
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_write_allowed(self):
+        """Setting a harmless scratchpad key should succeed."""
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="user_prefers_concise", value=True)
+        assert "Set scratchpad" in result
+        # Verify it was actually stored
+        result = await tool.execute(action="check", key="user_prefers_concise")
+        assert "True" in result
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_write_string_allowed(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="current_project", value="nanobot")
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_write_dict_allowed(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="task_meta", value={"step": 2, "total": 5})
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_model_blocked_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="model", value="gpt-4")
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_model_preset_blocked_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="model_preset", value="fast")
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_blocked_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="max_iterations", value=80)
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_context_window_blocked_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="context_window_tokens", value=262144)
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_dot_path_blocked_in_scratchpad_only(self):
+        """Dot-paths should be blocked — scratchpad keys are simple keys only."""
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="web_config.enable", value=True)
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_blocked_attr_blocked_in_scratchpad_only(self):
+        """Blocked attributes (e.g. 'tools') should still be blocked."""
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="tools", value={})
+        assert "Error" in result
+        assert "protected" in result
+
+    @pytest.mark.asyncio
+    async def test_real_attr_blocked_in_scratchpad_only(self):
+        """Real runtime attributes (e.g. 'workspace') cannot be overwritten."""
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="workspace", value="/tmp")
+        assert "Error" in result
+        assert "scratchpad-only" in result
+
+    @pytest.mark.asyncio
+    async def test_callable_rejected_in_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        result = await tool.execute(action="set", key="bad_value", value=lambda: None)
+        assert "Error" in result
+        assert "callable" in result
+
+    def test_description_shows_scratchpad_only(self):
+        tool = self._make_scratchpad_tool()
+        assert "SCRATCHPAD-ONLY" in tool.description
+        assert "READ-ONLY" not in tool.description
+
+    def test_description_shows_readonly_when_no_scratchpad(self):
+        """When allow_scratchpad=False and modify_allowed=False, show READ-ONLY."""
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=False, allow_scratchpad=False)
+        assert "READ-ONLY" in tool.description
+        assert "SCRATCHPAD-ONLY" not in tool.description
+
+    @pytest.mark.asyncio
+    async def test_scratchpad_persists_across_check(self):
+        """Scratchpad writes should be readable via check."""
+        tool = self._make_scratchpad_tool()
+        await tool.execute(action="set", key="session_model", value="nw-balanced")
+        result = await tool.execute(action="check", key="session_model")
+        assert "nw-balanced" in result
+
+
+# ---------------------------------------------------------------------------
 # runtime vars check fallback (Fix #1: cross-turn memory)
 # ---------------------------------------------------------------------------
 
@@ -1132,3 +1263,631 @@ class TestSetContext:
         tool.set_context(RequestContext(channel="feishu", chat_id="oc_abc123"))
         assert tool._channel == "feishu"
         assert tool._chat_id == "oc_abc123"
+
+
+# ===========================================================================
+# v2: Session isolation, size cap, concurrency, context race, redaction
+# ===========================================================================
+
+class TestScratchpadIsolation:
+    """A. Cross-session scratchpad isolation."""
+
+    @pytest.mark.asyncio
+    async def test_two_sessions_cannot_read_each_other_keys(self):
+        tool = _make_tool()
+        tok_a = _bind_ctx("telegram:1", channel="telegram", chat_id="1")
+        try:
+            await tool.execute(action="set", key="foo", value="bar")
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", channel="telegram", chat_id="2")
+        try:
+            result = await tool.execute(action="check", key="foo")
+        finally:
+            reset_request_context(tok_b)
+        assert "not found" in result or "foo" not in result
+
+    @pytest.mark.asyncio
+    async def test_two_sessions_cannot_write_each_other_keys(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok_a = _bind_ctx("telegram:1", channel="telegram", chat_id="1")
+        try:
+            await tool.execute(action="set", key="k", value="v1")
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", channel="telegram", chat_id="2")
+        try:
+            await tool.execute(action="set", key="k", value="v2")
+        finally:
+            reset_request_context(tok_b)
+        assert loop._runtime_vars["telegram:1"]["k"] == "v1"
+        assert loop._runtime_vars["telegram:2"]["k"] == "v2"
+
+    @pytest.mark.asyncio
+    async def test_no_context_falls_back_to_global(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="set", key="k", value="v")
+        assert "Set scratchpad" in result
+        assert loop._runtime_vars["__global__"]["k"] == "v"
+        result = await tool.execute(action="check", key="k")
+        assert "v" in result
+
+    @pytest.mark.asyncio
+    async def test_no_arg_check_only_returns_current_session(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok_a = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            await tool.execute(action="set", key="a_key", value="a")
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", chat_id="2")
+        try:
+            await tool.execute(action="set", key="b_key", value="b")
+            result = await tool.execute(action="check")
+        finally:
+            reset_request_context(tok_b)
+        assert "b_key" in result
+        assert "a_key" not in result
+
+    @pytest.mark.asyncio
+    async def test_check_scratchpad_alias_scoped(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok_a = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            await tool.execute(action="set", key="a_key", value="a")
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", chat_id="2")
+        try:
+            result = await tool.execute(action="check", key="scratchpad")
+        finally:
+            reset_request_context(tok_b)
+        assert "a_key" not in result
+
+    @pytest.mark.asyncio
+    async def test_require_context_blocks_write_without_session(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True, require_context=True)
+        result = await tool.execute(action="set", key="k", value="v")
+        assert result == "Error: no session context available"
+        assert "__global__" not in loop._runtime_vars or "k" not in loop._runtime_vars.get("__global__", {})
+
+    @pytest.mark.asyncio
+    async def test_require_context_honored_with_isolation_kill_switch(self):
+        """require_context and session_isolation are independent: even when
+        the kill-switch (session_isolation=False) is on, require_context=True
+        must still reject context-less writes instead of silently falling back
+        to __global__."""
+        loop = _make_mock_loop()
+        tool = MyTool(
+            runtime_state=loop, modify_allowed=True,
+            require_context=True, session_isolation=False,
+        )
+        result = await tool.execute(action="set", key="k", value="v")
+        assert result == "Error: no session context available"
+        assert "__global__" not in loop._runtime_vars or "k" not in loop._runtime_vars.get("__global__", {})
+
+    @pytest.mark.asyncio
+    async def test_require_context_blocks_read_without_session(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, require_context=True)
+        result = await tool.execute(action="check", key="scratchpad")
+        assert "no session context" in result
+
+    @pytest.mark.asyncio
+    async def test_session_isolation_kill_switch_flattens_to_global(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True, session_isolation=False)
+        tok_a = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            await tool.execute(action="set", key="k", value="v")
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", chat_id="2")
+        try:
+            result = await tool.execute(action="check", key="k")
+        finally:
+            reset_request_context(tok_b)
+        # Kill-switch: both sessions share __global__, so B sees A's key.
+        assert "<redacted>" in result or "'v'" in result
+        assert "telegram:1" not in loop._runtime_vars
+        assert GLOBAL_SESSION_KEY in loop._runtime_vars
+
+    @pytest.mark.asyncio
+    async def test_my_tool_excluded_from_subagent_scope(self):
+        """D17: subagents never receive the `my` tool — they cannot read or
+        write the parent's scratchpad. MyTool declares _scopes={'core'} and
+        _plugin_discoverable=False, so ToolLoader.load(scope='subagent')
+        excludes it on both counts. This resolves the v2 spec open question
+        #4: subagents run with an isolated tool registry that does not contain
+        `my`, so session-scope inheritance is moot."""
+        assert MyTool._plugin_discoverable is False
+        assert MyTool._scopes == {"core"}
+        assert "subagent" not in MyTool._scopes
+
+
+class TestScratchpadMigration:
+    """B. Eager-init (D15): legacy flat dicts are NOT migrated."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_flat_dict_is_invisible_not_migrated(self):
+        loop = _make_mock_loop()
+        loop._runtime_vars = {"legacy_key": 1}  # flat shape
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="legacy_key")
+        assert "not found" in result
+        # Shape unchanged — no auto-migration to __global__.
+        assert loop._runtime_vars == {"legacy_key": 1}
+
+    @pytest.mark.asyncio
+    async def test_global_scope_separate_from_request_scope(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        await tool.execute(action="set", key="g", value=1)
+        tok_a = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            await tool.execute(action="set", key="a", value=2)
+        finally:
+            reset_request_context(tok_a)
+        assert loop._runtime_vars["__global__"] == {"g": 1}
+        assert loop._runtime_vars["telegram:1"] == {"a": 2}
+
+
+class TestValueSizeCap:
+    """C. Per-value 8 KB cap."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_string_rejected(self):
+        tool = _make_tool()
+        result = await tool.execute(action="set", key="big", value="x" * 9000)
+        assert "Error" in result
+        assert "8192" in result
+
+    @pytest.mark.asyncio
+    async def test_oversized_dict_rejected(self):
+        tool = _make_tool()
+        big = {f"k{i}": "x" * 100 for i in range(100)}
+        result = await tool.execute(action="set", key="big", value=big)
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_at_limit_allowed(self):
+        tool = _make_tool()
+        # JSON repr of the string is "<chars>" = len + 2 quotes → aim for 8192.
+        s = "x" * (8192 - 2)
+        assert len(json.dumps(s, ensure_ascii=False)) <= 8192
+        result = await tool.execute(action="set", key="ok", value=s)
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_size_cap_applies_in_set_path(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True)
+        result = await tool.execute(action="set", key="big", value="x" * 9000)
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_callable_rejected_before_size_check(self):
+        tool = _make_tool()
+        result = await tool.execute(action="set", key="fn", value=lambda: None)
+        assert "callable" in result
+
+    @pytest.mark.asyncio
+    async def test_non_serializable_rejected(self):
+        tool = _make_tool()
+        result = await tool.execute(action="set", key="obj", value=Path("/tmp"))
+        assert "Error" in result
+
+
+class TestCountCapConcurrency:
+    """D. Per-session count cap + atomicity."""
+
+    @pytest.mark.asyncio
+    async def test_max_keys_per_session(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            for i in range(64):
+                await tool.execute(action="set", key=f"k{i}", value=i)
+            result = await tool.execute(action="set", key="k64", value=64)
+        finally:
+            reset_request_context(tok)
+        assert "full" in result
+        assert len(loop._runtime_vars["telegram:1"]) == 64
+
+    @pytest.mark.asyncio
+    async def test_max_keys_independent_per_session(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok_a = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            for i in range(64):
+                await tool.execute(action="set", key=f"k{i}", value=i)
+        finally:
+            reset_request_context(tok_a)
+        tok_b = _bind_ctx("telegram:2", chat_id="2")
+        try:
+            r = await tool.execute(action="set", key="bkey", value="ok")
+        finally:
+            reset_request_context(tok_b)
+        assert "Set scratchpad" in r
+
+    @pytest.mark.asyncio
+    async def test_concurrent_writes_do_not_exceed_cap(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok = _bind_ctx("telegram:1", chat_id="1")
+        try:
+            await asyncio.gather(*[
+                tool.execute(action="set", key=f"k{i}", value=i) for i in range(100)
+            ])
+        finally:
+            reset_request_context(tok)
+        assert len(loop._runtime_vars["telegram:1"]) == 64
+
+
+class TestContextRace:
+    """E. ContextVar context race — read at execute time, not instance-captured."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sessions_keep_own_session_key(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+
+        async def write_then_check(session_key, chat_id, val):
+            tok = _bind_ctx(session_key, chat_id=chat_id)
+            try:
+                await tool.execute(action="set", key="k", value=val)
+                # Yield mid-turn to allow interleaving.
+                await asyncio.sleep(0)
+                res = await tool.execute(action="check", key="k")
+                return res
+            finally:
+                reset_request_context(tok)
+
+        r1, r2 = await asyncio.gather(
+            write_then_check("telegram:1", "1", "v1"),
+            write_then_check("telegram:2", "2", "v2"),
+        )
+        assert "v1" in r1
+        assert "v2" in r2
+        assert loop._runtime_vars["telegram:1"]["k"] == "v1"
+        assert loop._runtime_vars["telegram:2"]["k"] == "v2"
+
+
+class TestAuditRedaction:
+    """F. Audit log redaction (D14)."""
+
+    @pytest.fixture
+    def log_sink(self):
+        records: list[str] = []
+
+        def sink(message):
+            records.append(str(message))
+
+        handler_id = logger.add(sink, level="DEBUG", format="{message}")
+        try:
+            yield records
+        finally:
+            logger.remove(handler_id)
+
+    @pytest.mark.asyncio
+    async def test_audit_redacts_sensitive_named_key(self, log_sink):
+        tool = _make_tool()
+        result = await tool.execute(action="set", key="api_key", value="sk-abc123")
+        assert "protected" in result
+        joined = "\n".join(log_sink)
+        assert "sk-abc123" not in joined
+
+    @pytest.mark.asyncio
+    async def test_audit_redacts_secret_shaped_value(self, log_sink):
+        tool = _make_tool()
+        # "foobar" is not a sensitive name; value matches sk- regex.
+        result = await tool.execute(
+            action="set", key="foobar",
+            value="sk-" + "a" * 40,
+        )
+        assert "Set scratchpad" in result
+        joined = "\n".join(log_sink)
+        assert "<redacted>" in joined
+        assert ("sk-" + "a" * 40) not in joined
+
+    @pytest.mark.asyncio
+    async def test_audit_non_sensitive_value_logged_plain(self, log_sink):
+        tool = _make_tool()
+        await tool.execute(action="set", key="k", value=42)
+        joined = "\n".join(log_sink)
+        assert "42" in joined
+
+    @pytest.mark.asyncio
+    async def test_audit_session_label_reflects_bound_context(self, log_sink):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        tok = _bind_ctx("telegram:42", chat_id="42")
+        try:
+            await tool.execute(action="set", key="k", value=1)
+        finally:
+            reset_request_context(tok)
+        joined = "\n".join(log_sink)
+        assert "telegram:42" in joined
+
+
+class TestOutputRedaction:
+    """D8. Tool return strings must not leak secrets."""
+
+    @pytest.mark.asyncio
+    async def test_sensitive_key_output_redacted(self):
+        loop = _make_mock_loop()
+        # Pre-seed via the tool itself using a non-sensitive alias trick won't
+        # work (_SENSITIVE_NAMES blocks "token"). Use direct scoped injection.
+        loop._runtime_vars = {"__global__": {"my_token_secret": "harmless"}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="my_token_secret")
+        assert "<redacted>" in result or "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_secret_value_output_redacted(self):
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"config": secret}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="config")
+        assert "<redacted>" in result
+        assert secret not in result
+
+    @pytest.mark.asyncio
+    async def test_benign_value_output_plain(self):
+        loop = _make_mock_loop()
+        loop._runtime_vars = {"__global__": {"task": "review"}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="task")
+        assert "review" in result
+
+    @pytest.mark.asyncio
+    async def test_inspect_redacts_sensitive_keys(self):
+        loop = _make_mock_loop()
+        loop._runtime_vars = {"__global__": {"api_key": "sk-leak", "note": "ok"}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="scratchpad")
+        assert "sk-leak" not in result
+        assert "<redacted>" in result
+        assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_inspect_redacts_secret_values(self):
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        loop._runtime_vars = {"__global__": {"token": secret, "count": 3}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="scratchpad")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_nested_secret_under_benign_key(self):
+        """D8: a secret nested in a dict under a non-sensitive top-level key
+        must not leak in the chat-visible set return string."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "sk-" + "a" * 40
+        result = await tool.execute(action="set", key="data", value={"api_key": secret})
+        assert "Set scratchpad" in result
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_nested_secret_in_list(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key="items", value=[secret, "ok"])
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_plain_for_benign_nested(self):
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="set", key="data", value={"a": 1, "b": "x"})
+        assert "{'a': 1, 'b': 'x'}" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_nested_secret_under_benign_key(self):
+        """D8 regression: a secret nested in a dict under a non-sensitive
+        top-level scratchpad key must not leak via the check/inspect path
+        (was previously only redacted on the set return; _format_value did
+        not recurse into dicts)."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"api_key": secret}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_in_list_value(self):
+        """D8 regression: a secret stored in a list scratchpad value must
+        not leak via check/inspect (list branch previously had no redaction)."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        loop._runtime_vars = {"__global__": {"items": [secret, "ok"]}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="items")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_check_scratchpad_redacts_nested_secret(self):
+        """D8 regression: check scratchpad (full session dict) must redact
+        nested secrets, not just the top level."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"api_key": secret}, "note": "ok"}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="scratchpad")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "ok" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_camelcase_secret_key(self):
+        """camelCase secret keys (apiKey, accessToken) must be redacted just
+        like their snake_case counterparts (D8 regression for camelCase)."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "sk-" + "a" * 40
+        result = await tool.execute(action="set", key="data", value={"apiKey": secret})
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_camelcase_secret_key(self):
+        """camelCase secret keys in scratchpad values must be redacted on the
+        check/inspect path too."""
+        loop = _make_mock_loop()
+        secret = "sk-" + "a" * 40
+        loop._runtime_vars = {"__global__": {"data": {"accessToken": secret}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_dict_key(self):
+        """A dict key that is itself a secret-shaped token (e.g.
+        {"ghp_...": "prod"}) must be redacted so the token never reaches
+        chat-visible output or audit logs."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key="data", value={secret: "prod"})
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_dict_key(self):
+        """Secret-shaped dict keys must also be redacted on the check/inspect
+        path, not just the set return."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        loop._runtime_vars = {"__global__": {"data": {secret: "prod"}}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_scratchpad_key(self):
+        """A secret-shaped scratchpad key (e.g. ghp_... used as the key) must
+        be redacted in the chat-visible 'Set scratchpad.<key>' response and
+        audit log, not just the value."""
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key=secret, value="prod")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_set_return_redacts_secret_shaped_scratchpad_key_allow_set(self):
+        """Same redaction must apply on the full allow_set path (_modify_free)."""
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True)
+        secret = "ghp_" + "a" * 36
+        result = await tool.execute(action="set", key=secret, value="prod")
+        assert secret not in result
+        assert "<redacted>" in result
+        assert "Set scratchpad" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_key_in_large_dict_preview(self):
+        """When a scratchpad dict has >5 keys, the preview branch in
+        _format_value must redact secret-shaped keys, not surface them raw."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        data = {secret: "prod"}
+        data.update({f"k{i}": i for i in range(6)})
+        loop._runtime_vars = {"__global__": {"data": data}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+    @pytest.mark.asyncio
+    async def test_check_redacts_secret_shaped_key_in_oversized_dict_preview(self):
+        """When a small dict's redacted repr exceeds 200 chars, the preview
+        branch must still redact secret-shaped keys."""
+        loop = _make_mock_loop()
+        secret = "ghp_" + "a" * 36
+        # 3 keys — small enough to enter the repr branch, but long values push
+        # the repr past 200 chars so it falls through to the preview branch.
+        data = {secret: "prod", "k1": "x" * 250, "k2": "y" * 250}
+        loop._runtime_vars = {"__global__": {"data": data}}
+        tool = _make_tool(runtime_state=loop)
+        result = await tool.execute(action="check", key="data")
+        assert secret not in result
+        assert "<redacted>" in result
+
+
+class TestValueSizeBytes:
+    """DoS size cap must be measured in UTF-8 bytes, not Python characters,
+    so multi-byte content (emoji, CJK) is bounded correctly."""
+
+    def test_multibyte_value_rejected_by_byte_length(self):
+        # ~8K emoji chars -> ~32KB UTF-8 bytes; must exceed the 8192-byte cap.
+        big = "😀" * 8200
+        err = MyTool._check_value_size(big)
+        assert err is not None
+        assert "exceeds" in err
+
+    def test_ascii_value_under_limit_accepted(self):
+        err = MyTool._check_value_size("a" * 100)
+        assert err is None
+
+
+class TestSessionCapEviction:
+    """D11. Global session cap with LRU eviction."""
+
+    @pytest.mark.asyncio
+    async def test_session_cap_evicts_lru(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True)
+        # Lower the cap for the test via monkeypatch on the instance.
+        tool._MAX_SESSIONS = 4
+        for i in range(tool._MAX_SESSIONS + 2):
+            tok = _bind_ctx(f"sess:{i}", chat_id=str(i))
+            try:
+                await tool.execute(action="set", key="k", value=i)
+            finally:
+                reset_request_context(tok)
+        assert len(loop._runtime_vars) <= tool._MAX_SESSIONS
+        # __global__ never evicted even though never written here.
+        assert "sess:0" not in loop._runtime_vars
+
+    @pytest.mark.asyncio
+    async def test_global_scope_never_evicted(self):
+        loop = _make_mock_loop()
+        tool = MyTool(runtime_state=loop, modify_allowed=True)
+        tool._MAX_SESSIONS = 2
+        loop._runtime_vars["__global__"] = {"g": 1}
+        loop._runtime_vars_lru["__global__"] = 0.0
+        tok = _bind_ctx("sess:1", chat_id="1")
+        try:
+            await tool.execute(action="set", key="k", value=1)
+            await tool.execute(action="set", key="k2", value=2)  # sess:2 not bound
+        finally:
+            reset_request_context(tok)
+        tok = _bind_ctx("sess:2", chat_id="2")
+        try:
+            await tool.execute(action="set", key="k", value=2)
+        finally:
+            reset_request_context(tok)
+        assert "__global__" in loop._runtime_vars
